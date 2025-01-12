@@ -33,26 +33,7 @@ interface CleanListing {
   externalUrl: string;
 }
 
-// Interfaces for request parameters
-interface SeeListingsParams {
-  checkInDate: string;
-  checkOutDate: string;
-  guestsCount?: number;
-}
-
-interface UserWantsToBookParams {
-  listingId: string;
-  checkInDate: string;
-  checkOutDate: string;
-  guestsCount: number;
-  email: string;
-}
-
-type ApiRequestBody =
-  | { name: 'see_listings'; parameters: SeeListingsParams }
-  | { name: 'user_wants_to_book'; parameters: UserWantsToBookParams };
-
-// Function to sanitize raw listing data
+// Utility function to clean raw listing data
 function cleanListing(rawListing: any): CleanListing {
   return {
     id: rawListing._id,
@@ -83,28 +64,46 @@ function cleanListing(rawListing: any): CleanListing {
   };
 }
 
-// Function to retrieve the latest Guesty token from the database
-async function getGuestyToken(): Promise<string> {
+// Function to store toolCallId and associated listings in the database
+async function storeToolCallListings(toolCallId: string, listings: CleanListing[]): Promise<void> {
   const client = await pool.connect();
   try {
-    const result = await client.query(
-      'SELECT token FROM auth_tokens ORDER BY created_at DESC LIMIT 1'
-    );
-    if (result.rows.length === 0) {
-      throw new Error('No valid token found');
+    const insertQuery = `
+      INSERT INTO tool_call_listings (tool_call_id, listing_id, title)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (tool_call_id, listing_id) DO NOTHING
+    `;
+    for (const listing of listings) {
+      await client.query(insertQuery, [toolCallId, listing.id, listing.title]);
     }
-    return result.rows[0].token;
+  } catch (error) {
+    console.error('Error storing tool call listings:', error);
+    throw error;
   } finally {
     client.release();
   }
 }
 
-// Function to check availability of listings on Guesty
+// Function to get the latest Guesty token by calling your existing endpoint
+async function getGuestyToken(): Promise<string> {
+  try {
+    const response = await axios.get('https://integritycorporatehousing.vercel.app/api/token/current');
+    return response.data.token;
+  } catch (error) {
+    console.error('Error retrieving Guesty token:', error);
+    throw new Error('Failed to retrieve Guesty token');
+  }
+}
+
+// Function to check availability on Guesty
 async function checkGuestyAvailability(
   token: string,
-  params: SeeListingsParams
+  params: {
+    checkInDate: string;
+    checkOutDate: string;
+    guestsCount?: number;
+  }
 ): Promise<CleanListing[]> {
-  // Base request parameters
   const requestParams: any = {
     active: true,
     pmsActive: true,
@@ -113,7 +112,6 @@ async function checkGuestyAvailability(
     skip: 0,
   };
 
-  // Add availability filters if provided
   if (params.checkInDate && params.checkOutDate) {
     requestParams.available = {
       checkIn: params.checkInDate,
@@ -123,9 +121,6 @@ async function checkGuestyAvailability(
       requestParams.available.minOccupancy = params.guestsCount;
     }
   }
-
-  // Log the request parameters for debugging
-  console.log('Requesting Guesty with params:', JSON.stringify(requestParams, null, 2));
 
   try {
     const response: AxiosResponse<any> = await axios.get(
@@ -150,8 +145,6 @@ async function checkGuestyAvailability(
     );
 
     const cleanListings: CleanListing[] = response.data.results.map(cleanListing);
-    console.log(`Found ${cleanListings.length} available listings`);
-
     return cleanListings;
   } catch (error: any) {
     console.error('Error checking Guesty availability:', error.response?.data || error.message);
@@ -164,23 +157,21 @@ async function checkGuestyAvailability(
 // Function to create a quote on Guesty
 async function createGuestyQuote(
   token: string,
-  params: UserWantsToBookParams
+  params: {
+    listingId: string;
+    checkInDate: string;
+    checkOutDate: string;
+    guestsCount: number;
+    email: string;
+  }
 ): Promise<any> {
-  const {
-    listingId,
-    checkInDate,
-    checkOutDate,
-    guestsCount,
-    email,
-  } = params;
-
   const payload = {
-    listingId,
-    checkInDateLocalized: checkInDate,
-    checkOutDateLocalized: checkOutDate,
-    guestsCount,
+    listingId: params.listingId,
+    checkInDateLocalized: params.checkInDate,
+    checkOutDateLocalized: params.checkOutDate,
+    guestsCount: params.guestsCount,
     source: 'manual_reservations',
-    email,
+    email: params.email,
   };
 
   try {
@@ -195,7 +186,6 @@ async function createGuestyQuote(
       }
     );
 
-    console.log('Quote created successfully:', response.data);
     return response.data;
   } catch (error: any) {
     console.error('Error creating Guesty quote:', error.response?.data || error.message);
@@ -212,61 +202,111 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  let body: ApiRequestBody;
-
-  // Validate and parse request body
   try {
-    body = req.body;
-    if (!body || typeof body !== 'object') {
-      throw new Error('Invalid request body');
+    // Parse the VAPI message
+    const vapiMessage = req.body.message;
+    if (!vapiMessage || !vapiMessage.toolCalls || vapiMessage.toolCalls.length === 0) {
+      return res.status(400).json({ error: 'Invalid request format: Missing toolCalls' });
     }
-    if (!body.name || !body.parameters) {
-      throw new Error('Missing "name" or "parameters" in request body');
-    }
-  } catch (err: any) {
-    console.error('Invalid request:', err.message);
-    return res.status(400).json({ error: 'Invalid request format', details: err.message });
-  }
 
-  try {
+    const toolCall = vapiMessage.toolCalls[0];
+    const toolCallId = toolCall.id;
+    const functionCall = toolCall.function;
+
+    if (!functionCall || !functionCall.name || !functionCall.arguments) {
+      return res.status(400).json({ error: 'Invalid request format: Missing function details' });
+    }
+
+    const functionName = functionCall.name;
+    const functionArguments = functionCall.arguments;
+
+    // Parse the arguments string into an object
+    let parameters: any;
+    try {
+      parameters = JSON.parse(functionArguments);
+    } catch (err: any) {
+      console.error('Invalid function arguments JSON:', err.message);
+      return res.status(400).json({ error: 'Invalid function arguments JSON' });
+    }
+
     const token = await getGuestyToken();
 
-    switch (body.name) {
+    let result: any;
+
+    switch (functionName) {
       case 'see_listings':
         {
-          const params = body.parameters as SeeListingsParams;
-
-          // Validate required parameters
-          if (!params.checkInDate || !params.checkOutDate) {
+          const availableParams = parameters.available;
+          if (!availableParams || !availableParams.check_in || !availableParams.check_out) {
             return res.status(400).json({
-              error: 'Missing required parameters: checkInDate and checkOutDate',
+              error: 'Missing required parameters: available.check_in and available.check_out',
             });
           }
 
+          const params = {
+            checkInDate: availableParams.check_in,
+            checkOutDate: availableParams.check_out,
+            guestsCount: availableParams.min_occupancy,
+          };
+
           const listings = await checkGuestyAvailability(token, params);
-          return res.status(200).json({ listings });
+
+          // Store the toolCallId and associated listings in the database
+          await storeToolCallListings(toolCallId, listings);
+
+          // Prepare a concise, flat string result with listing IDs and titles
+          if (listings.length === 0) {
+            result = 'No listings are available for the selected dates.';
+          } else {
+            // Build a simple string listing IDs and titles
+            const listingDescriptions = listings.map((listing, index) => {
+              return `${index + 1}. (ID: ${listing.id}) ${listing.title}`;
+            }).join('; ');
+            result = `Available listings: ${listingDescriptions}`;
+          }
         }
+        break;
 
       case 'user_wants_to_book':
         {
-          const params = body.parameters as UserWantsToBookParams;
+          const { listingId, checkInDate, checkOutDate, guestsCount, email } = parameters;
 
           // Validate required parameters
           const requiredFields = ['listingId', 'checkInDate', 'checkOutDate', 'guestsCount', 'email'];
-          const missingFields = requiredFields.filter(field => !(field in params));
+          const missingFields = requiredFields.filter((field) => !(field in parameters));
           if (missingFields.length > 0) {
             return res.status(400).json({
               error: `Missing required parameters: ${missingFields.join(', ')}`,
             });
           }
 
-          const quote = await createGuestyQuote(token, params);
-          return res.status(200).json({ quote });
+          // Get the quote from Guesty
+          const quote = await createGuestyQuote(token, {
+            listingId,
+            checkInDate,
+            checkOutDate,
+            guestsCount,
+            email,
+          });
+
+          // Pass the Guesty response directly
+          result = quote;
         }
+        break;
 
       default:
         return res.status(400).json({ error: 'Unknown function name' });
     }
+
+    // Return the response in the required format
+    return res.status(200).json({
+      results: [
+        {
+          toolCallId: toolCallId,
+          result: result,
+        },
+      ],
+    });
   } catch (error: any) {
     console.error('Handler error:', error.message);
     return res.status(500).json({

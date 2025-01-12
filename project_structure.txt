@@ -1,0 +1,32 @@
+.
+├── README.md
+├── app
+│   └── api
+├── package-lock.json
+├── package.json
+├── project_structure.txt
+├── scripts
+│   ├── create-vapi-assistant.ts
+│   └── test-vapi-call.ts
+├── src
+│   ├── lib
+│   │   └── db.ts
+│   └── pages
+│       ├── api
+│       │   ├── assistant.ts
+│       │   ├── cron.ts
+│       │   ├── inbox
+│       │   │   └── index.ts
+│       │   ├── properties
+│       │   │   └── get-property.ts
+│       │   ├── token
+│       │   │   ├── current.ts
+│       │   │   └── refresh.ts
+│       │   ├── vapi
+│       │   │   └── functions.ts
+│       │   └── webhook
+│       └── inbox.tsx
+├── tsconfig.json
+└── vercel.json
+
+13 directories, 17 files
